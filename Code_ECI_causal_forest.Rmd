@@ -1,0 +1,1650 @@
+---
+title: "ECI Causal Forest Main Model and Robustness Checks"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(fixest)
+library(grf)
+library(ggplot2)
+library(gghalves)
+library(openxlsx)
+library(lmtest)
+library(sandwich)
+library(car)
+library(patchwork)
+library(scales)
+
+set.seed(42)
+quiet_output <- TRUE
+quiet_cat <- function(...) {
+  if (!quiet_output) cat(...)
+}
+
+n_detected_cores <- tryCatch(parallel::detectCores(logical = FALSE), error = function(e) NA_integer_)
+if (length(n_detected_cores) == 0 || is.na(n_detected_cores)) {
+  n_detected_cores <- tryCatch(parallel::detectCores(), error = function(e) 1L)
+}
+if (length(n_detected_cores) == 0 || is.na(n_detected_cores)) {
+  n_detected_cores <- 1L
+}
+n_parallel_workers <- max(1L, as.integer(n_detected_cores) - 1L)
+n_parallel_workers_env <- suppressWarnings(as.integer(Sys.getenv("ECI_PARALLEL_WORKERS", NA_character_)))
+if (is.finite(n_parallel_workers_env) && n_parallel_workers_env >= 1L) {
+  n_parallel_workers <- n_parallel_workers_env
+}
+
+parallel_map_with_progress <- function(X, FUN, ..., workers = n_parallel_workers,
+                                       progress_label = NULL, chunk_size = NULL) {
+  n <- length(X)
+  if (n == 0L) return(list())
+  workers <- as.integer(workers)
+  if (length(workers) == 0 || is.na(workers) || workers < 1L) {
+    workers <- 1L
+  }
+  if (is.null(chunk_size)) {
+    chunk_size <- max(1L, workers)
+  }
+  chunk_size <- as.integer(chunk_size)
+  if (length(chunk_size) == 0 || is.na(chunk_size) || chunk_size < 1L) {
+    chunk_size <- 1L
+  }
+
+  results <- vector("list", n)
+  chunk_starts <- seq.int(1L, n, by = chunk_size)
+
+  if (!is.null(progress_label) && !quiet_output) {
+    cat(progress_label, "\n")
+    pb <- utils::txtProgressBar(min = 0, max = n, style = 3)
+    on.exit(close(pb), add = TRUE)
+  }
+
+  for (chunk_start in chunk_starts) {
+    idx <- chunk_start:min(chunk_start + chunk_size - 1L, n)
+    chunk <- X[idx]
+    chunk_start_time <- Sys.time()
+
+    chunk_res <- if (.Platform$OS.type == "windows" || workers <= 1L || length(chunk) == 1L) {
+      lapply(chunk, FUN, ...)
+    } else {
+      parallel::mclapply(
+        chunk, FUN, ...,
+        mc.cores = min(workers, length(chunk)),
+        mc.preschedule = TRUE,
+        mc.set.seed = FALSE
+      )
+    }
+
+    results[idx] <- chunk_res
+
+    if (!is.null(progress_label) && !quiet_output) {
+      utils::setTxtProgressBar(pb, max(idx))
+      elapsed_chunk <- round(as.numeric(difftime(Sys.time(), chunk_start_time, units = "secs")), 1)
+      cat(sprintf("  completed %d-%d / %d (chunk %.1fs)\n", min(idx), max(idx), n, elapsed_chunk))
+    }
+  }
+
+  if (!is.null(progress_label) && !quiet_output) {
+    cat(sprintf(" %s done.\n", progress_label))
+  }
+
+  results
+}
+
+eci_infile <- "cityOES_merged_2015_2020.xlsx"
+eci_sheet <- "cf_model_data_with_X"
+eci_current_x_sheet <- "cleaned_panel_full"
+pm_infile <- "citypm_merged_2015_2020.xlsx"
+
+raw_eci <- read_xlsx(eci_infile, sheet = eci_sheet)
+eci_current_x_data <- read_xlsx(eci_infile, sheet = eci_current_x_sheet)
+raw_pm <- read_xlsx(pm_infile)
+
+id_var <- "HJYSGKFQBM"
+city_var <- "city_name"
+cluster_var <- "city_cluster"
+year_var <- "year"
+outcome_var <- "ECI_model"
+policy_year <- 2020L
+
+cf_num_trees <- as.integer(Sys.getenv("ECI_CF_NUM_TREES", "8000"))
+cf_fast_num_trees <- as.integer(Sys.getenv("ECI_CF_FAST_NUM_TREES", "1000"))
+n_placebo <- as.integer(Sys.getenv("ECI_N_PLACEBO", "1000"))
+n_bootstrap <- as.integer(Sys.getenv("ECI_N_BOOTSTRAP", "1000"))
+pdp_ci_boot <- as.integer(Sys.getenv("ECI_PDP_CI_BOOT", "200"))
+cf_tune_parameters <- !tolower(Sys.getenv("ECI_CF_TUNE", "true")) %in% c("0", "false", "no")
+
+patch_current_x_vars <- c("rainfall", "population_density_km2", "built_share", "cropland_share")
+patch_reduced_x_vars <- c(
+  "rainfall",
+  "population_density_pre_1519",
+  "built_share_pre_1519",
+  "cropland_share_pre_1519"
+)
+
+full_x_vars <- patch_current_x_vars
+full_nuisance_vars <- patch_current_x_vars
+reduced_x_vars <- patch_reduced_x_vars
+reduced_nuisance_vars <- "rainfall"
+
+regional_exclusion_city_names <- unique(c(
+  "北京市", "天津市", "石家庄市", "唐山市", "廊坊市", "保定市", "沧州市",
+  "衡水市", "邢台市", "邯郸市", "太原市", "阳泉市", "长治市", "晋城市",
+  "济南市", "淄博市", "济宁市", "德州市", "聊城市", "滨州市", "菏泽市",
+  "郑州市", "开封市", "安阳市", "鹤壁市", "新乡市", "焦作市", "濮阳市",
+  "上海市", "南京市", "无锡市", "徐州市", "常州市", "苏州市", "南通市",
+  "连云港市", "淮安市", "盐城市", "扬州市", "镇江市", "泰州市", "宿迁市",
+  "杭州市", "宁波市", "温州市", "湖州市", "嘉兴市", "绍兴市", "金华市",
+  "衢州市", "舟山市", "台州市", "丽水市", "合肥市", "芜湖市", "蚌埠市",
+  "淮南市", "马鞍山市", "淮北市", "铜陵市", "安庆市", "黄山市", "阜阳市",
+  "宿州市", "滁州市", "六安市", "亳州市", "池州市", "宣城市",
+  "吕梁市", "晋中市", "临汾市", "运城市", "西安市", "咸阳市", "宝鸡市",
+  "铜川市", "渭南市", "洛阳市", "三门峡市"
+))
+
+theme_eci <- theme_bw(base_size = 12) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(color = "grey50", fill = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "grey40", linewidth = 0.5),
+    axis.ticks = element_line(colour = "grey40", linewidth = 0.5),
+    axis.title = element_text(color = "black", size = 12),
+    axis.text = element_text(color = "grey20", size = 11),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5, color = "black"),
+    plot.tag = element_text(size = 13, color = "black", face = "bold"),
+    legend.position = "none"
+  )
+theme_set(theme_eci)
+
+slope_or_na <- function(y, x) {
+  ok <- is.finite(y) & is.finite(x)
+  if (sum(ok) < 2 || length(unique(x[ok])) < 2) return(NA_real_)
+  unname(coef(lm(y[ok] ~ x[ok]))[2])
+}
+
+scale_matrix <- function(df) {
+  mat <- as.matrix(as.data.frame(lapply(df, as.numeric)))
+  centers <- apply(mat, 2, mean, na.rm = TRUE)
+  scales <- apply(mat, 2, sd, na.rm = TRUE)
+  scales[!is.finite(scales) | scales == 0] <- 1
+  out <- sweep(sweep(mat, 2, centers, "-"), 2, scales, "/")
+  attr(out, "scaled:center") <- centers
+  attr(out, "scaled:scale") <- scales
+  out
+}
+
+first_non_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  x[1]
+}
+
+pm_covars <- raw_pm %>%
+  mutate(
+    year = as.integer(Year),
+    city_name = as.character(city_name)
+  ) %>%
+  select(city_name, city_code, prov_code, year, COVID)
+
+base_eci <- raw_eci %>%
+  mutate(
+    city_name = as.character(city_name),
+    year = as.integer(.data[[year_var]]),
+    ECI_model = as.numeric(ECI_model),
+    treatment = as.numeric(treatment),
+    yreb = as.integer(yreb),
+    post = as.integer(year >= policy_year),
+    event_time = as.integer(year - policy_year)
+  )
+
+cleaned_eci_baseline <- base_eci %>%
+  filter(year >= 2015, year <= 2019) %>%
+  group_by(.data[[id_var]]) %>%
+  summarise(
+    ECI_pre_1519 = mean(ECI_model, na.rm = TRUE),
+    ECI_trend_1519 = slope_or_na(ECI_model, year),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ECI_pre_1519 = ifelse(is.nan(ECI_pre_1519), NA_real_, ECI_pre_1519),
+    ECI_trend_1519 = ifelse(is.na(ECI_trend_1519), 0, ECI_trend_1519)
+  )
+
+unit_current_x <- eci_current_x_data %>%
+  mutate(year = as.integer(year)) %>%
+  select(
+    all_of(id_var), year,
+    population_density_km2, built_share, cropland_share
+  )
+
+base_eci <- base_eci %>%
+  select(-any_of(c(
+    "ECI_pre_1519", "ECI_trend_1519",
+    "population_density_km2", "built_share", "cropland_share"
+  ))) %>%
+  left_join(cleaned_eci_baseline, by = id_var) %>%
+  left_join(unit_current_x, by = c(id_var, "year")) %>%
+  left_join(pm_covars, by = c("city_name", "year"))
+
+city_match_diagnostics <- base_eci %>%
+  distinct(PROV, city_name, city_cluster, city_code) %>%
+  mutate(has_pm_match = !is.na(city_code)) %>%
+  arrange(PROV, city_name)
+
+sample_summary <- data.frame(
+  item = c(
+    "n_obs", "n_units", "n_cities", "pm_matched_cities", "pm_unmatched_cities",
+    "treated_obs", "control_obs", "treated_units", "control_units",
+    "year_min", "year_max", "ECI_mean", "ECI_median", "ECI_p99", "ECI_max"
+  ),
+  value = c(
+    nrow(base_eci),
+    n_distinct(base_eci[[id_var]]),
+    n_distinct(base_eci[[cluster_var]]),
+    n_distinct(base_eci[[cluster_var]][!is.na(base_eci$city_code)]),
+    n_distinct(base_eci[[cluster_var]][is.na(base_eci$city_code)]),
+    sum(base_eci$treatment == 1, na.rm = TRUE),
+    sum(base_eci$treatment == 0, na.rm = TRUE),
+    n_distinct(base_eci[[id_var]][base_eci$yreb == 1]),
+    n_distinct(base_eci[[id_var]][base_eci$yreb == 0]),
+    min(base_eci$year, na.rm = TRUE),
+    max(base_eci$year, na.rm = TRUE),
+    mean(base_eci$ECI_model, na.rm = TRUE),
+    median(base_eci$ECI_model, na.rm = TRUE),
+    unname(quantile(base_eci$ECI_model, 0.99, na.rm = TRUE)),
+    max(base_eci$ECI_model, na.rm = TRUE)
+  )
+)
+print(sample_summary)
+```
+
+# Main And Structured Robustness Models
+
+```{r}
+make_panel <- function(df, years, spec = c("full", "reduced"),
+                       drop_city_names = NULL, keep_city_names = NULL) {
+  spec <- match.arg(spec)
+  years <- sort(unique(as.integer(years)))
+
+  out <- df %>%
+    mutate(Year_calendar = as.integer(year)) %>%
+    filter(Year_calendar %in% years)
+
+  if (!is.null(drop_city_names)) {
+    out <- out %>% filter(!(city_name %in% drop_city_names))
+  }
+  if (!is.null(keep_city_names)) {
+    out <- out %>% filter(city_name %in% keep_city_names)
+  }
+
+  year_map <- data.frame(
+    Year_calendar = years,
+    Year_model = seq_along(years)
+  )
+
+  out <- out %>%
+    left_join(year_map, by = "Year_calendar") %>%
+    mutate(
+      post = as.integer(Year_calendar >= policy_year),
+      treatment = as.integer(yreb == 1 & post == 1),
+      treated = treatment
+    ) %>%
+    arrange(Year_model, .data[[cluster_var]], .data[[id_var]])
+
+  if (spec == "full") {
+    x_vars <- full_x_vars
+    nuisance_vars <- full_nuisance_vars
+  } else {
+    x_vars <- reduced_x_vars
+    nuisance_vars <- reduced_nuisance_vars
+  }
+
+  list(
+    data = out,
+    x_vars = x_vars,
+    nuisance_vars = nuisance_vars,
+    years = years,
+    spec = spec
+  )
+}
+
+fit_cf_model <- function(panel, label, outcome = outcome_var, num_trees = cf_num_trees,
+                         seed = 42, tune = TRUE) {
+  df <- panel$data
+  x_vars <- panel$x_vars
+  nuisance_vars <- panel$nuisance_vars
+  need_cols <- unique(c(
+    outcome, "treatment", x_vars, nuisance_vars, id_var, cluster_var,
+    "Year_model", "Year_calendar", "city_name", "yreb", "post", "PROV", "near_ecrl_proxy"
+  ))
+  miss_cols <- setdiff(need_cols, names(df))
+  if (length(miss_cols) > 0) {
+    stop(paste("Missing columns in", label, ":", paste(miss_cols, collapse = ", ")))
+  }
+
+  df <- df %>% filter(if_all(all_of(need_cols), ~ !is.na(.)))
+  Y <- df[[outcome]]
+  W <- as.numeric(df$treatment)
+  X_df <- df[, x_vars, drop = FALSE]
+  X <- scale_matrix(X_df)
+  colnames(X) <- x_vars
+
+  fmlY <- as.formula(paste0(
+    outcome, " ~ ", paste(nuisance_vars, collapse = " + "),
+    " | near_ecrl_proxy + ", cluster_var, " + Year_model"
+  ))
+  fmlW <- as.formula(paste0(
+    "treatment ~ ", paste(nuisance_vars, collapse = " + "),
+    " | near_ecrl_proxy + ", cluster_var, " + Year_model"
+  ))
+
+  mY <- feols(fmlY, data = df)
+  Y.hat <- predict(mY)
+  mW <- feols(fmlW, data = df)
+  W.hat <- pmin(pmax(as.numeric(predict(mW)), 0), 1)
+
+  clusters <- as.integer(factor(df[[cluster_var]]))
+  cf <- causal_forest(
+    X = X,
+    Y = Y,
+    W = W,
+    Y.hat = Y.hat,
+    W.hat = W.hat,
+    clusters = clusters,
+    num.trees = num_trees,
+    equalize.cluster.weights = TRUE,
+    honesty = TRUE,
+    tune.parameters = if (tune) "all" else "none",
+    min.node.size = 5,
+    seed = seed
+  )
+
+  ate <- average_treatment_effect(cf, target.sample = "treated")
+  est <- unname(ate[["estimate"]])
+  se <- unname(ate[["std.err"]])
+  z <- est / se
+  p <- 2 * pnorm(-abs(z))
+  ci_lo <- est - 1.96 * se
+  ci_hi <- est + 1.96 * se
+
+  pred <- predict(cf)
+  df$ITE <- as.numeric(pred$predictions)
+  vi <- data.frame(
+    Variable = colnames(X),
+    Importance = as.numeric(variable_importance(cf))
+  ) %>% arrange(desc(Importance))
+
+  summary <- data.frame(
+    model = label,
+    outcome = outcome,
+    estimate = est,
+    std_err = se,
+    z_value = z,
+    p_value = p,
+    ci95_lo = ci_lo,
+    ci95_hi = ci_hi,
+    n_obs = nrow(df),
+    n_units = n_distinct(df[[id_var]]),
+    n_cities = n_distinct(df[[cluster_var]]),
+    years = paste(panel$years, collapse = ","),
+    forest_X = paste(x_vars, collapse = " + "),
+    nuisance_controls = paste(nuisance_vars, collapse = " + "),
+    fixed_effects = paste("near_ecrl_proxy", cluster_var, "Year_model", sep = " + ")
+  )
+
+  list(
+    label = label,
+    panel = panel,
+    data = df,
+    X_df = X_df,
+    X = X,
+    x_center = attr(X, "scaled:center"),
+    x_scale = attr(X, "scaled:scale"),
+    Y = Y,
+    W = W,
+    Y.hat = Y.hat,
+    W.hat = W.hat,
+    clusters = clusters,
+    cf = cf,
+    summary = summary,
+    vi = vi
+  )
+}
+
+event_study_model <- function(panel, label) {
+  df <- panel$data
+  controls <- panel$nuisance_vars
+  need_cols <- c(outcome_var, "yreb", "post", controls, cluster_var, "Year_model", "Year_calendar")
+  df_es <- df %>%
+    filter(if_all(all_of(c(need_cols, "near_ecrl_proxy", "PROV")), ~ !is.na(.))) %>%
+    transmute(
+      id = .data[[cluster_var]],
+      time = as.integer(Year_model),
+      calendar_year = Year_calendar,
+      Y = as.numeric(.data[[outcome_var]]),
+      treat_city = as.integer(yreb == 1),
+      post = as.integer(post == 1),
+      near_ecrl_proxy = near_ecrl_proxy,
+      PROV = PROV,
+      across(all_of(controls), as.numeric)
+    ) %>%
+    group_by(id) %>%
+    mutate(T0 = ifelse(any(treat_city == 1 & post == 1), min(time[post == 1 & treat_city == 1]), NA_real_)) %>%
+    ungroup() %>%
+    mutate(k = time - T0)
+
+  k_min <- suppressWarnings(min(df_es$k[df_es$treat_city == 1], na.rm = TRUE))
+  k_max <- suppressWarnings(max(df_es$k[df_es$treat_city == 1], na.rm = TRUE))
+  ref_k <- -1L
+  ks_plot <- seq(k_min, k_max)
+  ks_no_ref <- ks_plot[ks_plot != ref_k]
+  event_name <- function(kk) if (kk < 0) paste0("dmin", abs(kk)) else paste0("d", kk)
+
+  for (kk in ks_no_ref) {
+    df_es[[event_name(kk)]] <- as.integer(df_es$treat_city == 1 & df_es$k == kk)
+  }
+
+  controls_within <- paste0(controls, "_within")
+  for (j in seq_along(controls)) {
+    df_es[[controls_within[j]]] <- resid(feols(as.formula(paste0(controls[j], " ~ 1 | id + time")), data = df_es))
+  }
+
+  rhs <- paste(
+    c(sapply(ks_no_ref, event_name), controls_within,
+      "factor(near_ecrl_proxy)", "factor(time)", "factor(PROV)"),
+    collapse = " + "
+  )
+  m_es <- lm(as.formula(paste("Y ~", rhs)), data = df_es)
+  Vcl <- sandwich::vcovCL(m_es, cluster = df_es$id, type = "HC1")
+
+  pre_ks <- ks_plot[ks_plot < 0 & ks_plot != ref_k]
+  lead_names <- sapply(pre_ks, event_name)
+  lead_names <- lead_names[lead_names %in% names(coef(m_es))]
+
+  wald_p <- NA_real_
+  if (length(lead_names) > 0) {
+    wald_res <- car::linearHypothesis(m_es, paste0(lead_names, " = 0"), vcov. = Vcl, test = "F")
+    wald_p <- wald_res[2, "Pr(>F)"]
+  }
+
+  coef_names <- sapply(ks_no_ref, event_name)
+  coefs <- stats::coef(m_es)[coef_names]
+  ses <- sqrt(diag(Vcl))[coef_names]
+
+  event_df <- data.frame(model = label, exposure = ks_plot, coef = NA_real_, se = NA_real_)
+  event_df$coef[event_df$exposure != ref_k] <- coefs
+  event_df$se[event_df$exposure != ref_k] <- ses
+  event_df$coef[event_df$exposure == ref_k] <- 0
+  event_df$se[event_df$exposure == ref_k] <- 0
+  t0_model <- unique(df_es$time[df_es$treat_city == 1 & df_es$post == 1])
+  t0_model <- min(t0_model, na.rm = TRUE)
+  year_lookup <- panel$data %>% distinct(Year_model, Year_calendar)
+  event_df <- event_df %>%
+    mutate(
+      ci_lo = coef - 1.96 * se,
+      ci_hi = coef + 1.96 * se,
+      Year_model = t0_model + exposure
+    ) %>%
+    left_join(year_lookup, by = "Year_model")
+
+  p_event <- ggplot(event_df, aes(x = exposure, y = coef)) +
+    geom_hline(yintercept = 0, linewidth = 0.5) +
+    geom_line(linetype = "dashed", linewidth = 0.6) +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.12, linewidth = 0.5) +
+    annotate(
+      "label", x = Inf, y = Inf,
+      label = paste0("Wald pre-trend p = ", format.pval(wald_p, digits = 3, eps = 0.001)),
+      hjust = 1.02, vjust = 1.1, size = 3.5, label.size = 0.25
+    ) +
+    labs(
+      x = "Event time (baseline = -1)",
+      y = "Treatment effect on ECI",
+      title = paste0("Event Study: ", label)
+    )
+
+  list(
+    coefficients = event_df,
+    wald = data.frame(model = label, tested_leads = paste(lead_names, collapse = " + "), p_value = wald_p),
+    plot = p_event
+  )
+}
+
+did_model <- function(panel, label) {
+  df <- panel$data
+  controls <- panel$nuisance_vars
+  need_cols <- c(outcome_var, "treatment", controls, cluster_var, "Year_model", "near_ecrl_proxy", "PROV")
+  df_did <- df %>% filter(if_all(all_of(need_cols), ~ !is.na(.)))
+  fml <- as.formula(paste0(
+    outcome_var, " ~ treatment + ", paste(controls, collapse = " + "),
+    " | near_ecrl_proxy + Year_model + PROV"
+  ))
+  m <- feols(fml, data = df_did, cluster = as.formula(paste0("~", cluster_var)))
+  ct <- coeftable(m)
+  data.frame(
+    model = label,
+    estimate = unname(ct["treatment", "Estimate"]),
+    std_err = unname(ct["treatment", "Std. Error"]),
+    t_value = unname(ct["treatment", "t value"]),
+    p_value = unname(ct["treatment", "Pr(>|t|)"]),
+    n_obs = nobs(m),
+    n_units = n_distinct(df_did[[id_var]]),
+    n_cities = n_distinct(df_did[[cluster_var]]),
+    controls = paste(controls, collapse = " + "),
+    fixed_effects = "near_ecrl_proxy + Year_model + PROV"
+  )
+}
+
+fit_model_bundle <- function(label, years, spec = "full",
+                             drop_city_names = NULL, keep_city_names = NULL,
+                             num_trees = cf_num_trees, seed = 42,
+                             include_did_event = TRUE,
+                             tune = cf_tune_parameters) {
+  panel <- make_panel(
+    base_eci,
+    years = years,
+    spec = spec,
+    drop_city_names = drop_city_names,
+    keep_city_names = keep_city_names
+  )
+  cf_res <- fit_cf_model(panel, label = label, num_trees = num_trees, seed = seed, tune = tune)
+  es_res <- if (include_did_event) event_study_model(panel, label = label) else NULL
+  did_res <- if (include_did_event) did_model(panel, label = label) else NULL
+  list(panel = panel, cf = cf_res, event = es_res, did = did_res)
+}
+
+print_bundle_results <- function(bundle) {
+  invisible(bundle)
+}
+
+summarise_bundle <- function(bundle) {
+  data.frame(
+    model = bundle$cf$label,
+    cf_att = bundle$cf$summary$estimate,
+    cf_se = bundle$cf$summary$std_err,
+    cf_p = bundle$cf$summary$p_value,
+    did_att = bundle$did$estimate,
+    did_se = bundle$did$std_err,
+    did_p = bundle$did$p_value,
+    event_pretrend_p = bundle$event$wald$p_value,
+    n_obs = bundle$cf$summary$n_obs,
+    n_units = bundle$cf$summary$n_units,
+    n_cities = bundle$cf$summary$n_cities
+  )
+}
+
+summarise_cf <- function(bundle) {
+  data.frame(
+    model = bundle$cf$label,
+    cf_att = bundle$cf$summary$estimate,
+    cf_se = bundle$cf$summary$std_err,
+    cf_p = bundle$cf$summary$p_value,
+    n_obs = bundle$cf$summary$n_obs,
+    n_units = bundle$cf$summary$n_units,
+    n_cities = bundle$cf$summary$n_cities
+  )
+}
+
+main_bundle <- fit_model_bundle(
+  label = "Main CF: 2017-2020 all-X",
+  years = 2017:2020,
+  spec = "full",
+  seed = 42
+)
+print_bundle_results(main_bundle)
+
+reduced_bundle <- fit_model_bundle(
+  label = "Reduced-X CF: 2017-2020",
+  years = 2017:2020,
+  spec = "reduced",
+  seed = 42
+)
+print_bundle_results(reduced_bundle)
+
+full_year_bundle <- fit_model_bundle(
+  label = "Year-extended CF: 2015-2020 all-X",
+  years = 2015:2020,
+  spec = "full",
+  seed = 42
+)
+print_bundle_results(full_year_bundle)
+
+drop2019_bundle <- fit_model_bundle(
+  label = "Drop-2019 CF: 2017-2018 and 2020 all-X",
+  years = c(2017, 2018, 2020),
+  spec = "full",
+  seed = 42,
+  include_did_event = FALSE
+)
+print_bundle_results(drop2019_bundle)
+
+structured_model_table <- bind_rows(
+  summarise_bundle(main_bundle),
+  summarise_bundle(reduced_bundle),
+  summarise_bundle(full_year_bundle)
+)
+print(structured_model_table)
+```
+
+# COVID-19, GDP, And Regional Robustness Models
+
+```{r}
+gdp_change <- raw_pm %>%
+  filter(Year %in% c(2019, 2020)) %>%
+  select(city_name, Year, gdp) %>%
+  pivot_wider(names_from = Year, values_from = gdp, names_prefix = "gdp_") %>%
+  mutate(gdp_growth_2020 = (gdp_2020 - gdp_2019) / gdp_2019)
+negative_gdp_cities <- gdp_change %>%
+  filter(!is.na(gdp_growth_2020), gdp_growth_2020 < 0) %>%
+  pull(city_name) %>%
+  unique()
+
+negative_gdp_bundle <- fit_model_bundle(
+  label = "Exclude negative GDP growth cities",
+  years = 2017:2020,
+  spec = "full",
+  drop_city_names = negative_gdp_cities,
+  seed = 42,
+  include_did_event = FALSE
+)
+quiet_cat(sprintf("\nNegative-GDP-growth cities excluded: %d\n", length(negative_gdp_cities)))
+print_bundle_results(negative_gdp_bundle)
+
+covid_2020 <- raw_pm %>%
+  filter(Year == 2020, !is.na(COVID)) %>%
+  group_by(city_name) %>%
+  summarise(COVID_2020 = sum(as.numeric(COVID), na.rm = TRUE), .groups = "drop")
+covid_cut <- quantile(covid_2020$COVID_2020, 0.9, na.rm = TRUE)
+top_covid_cities <- covid_2020 %>%
+  filter(COVID_2020 > covid_cut) %>%
+  pull(city_name) %>%
+  unique()
+
+covid_bundle <- fit_model_bundle(
+  label = "Exclude top decile COVID cities",
+  years = 2017:2020,
+  spec = "full",
+  drop_city_names = top_covid_cities,
+  seed = 42,
+  include_did_event = FALSE
+)
+quiet_cat(sprintf("\nTop-decile COVID cities excluded: %d\n", length(top_covid_cities)))
+print_bundle_results(covid_bundle)
+
+covid_gdp_cities <- union(negative_gdp_cities, top_covid_cities)
+covid_gdp_bundle <- fit_model_bundle(
+  label = "Exclude negative GDP or top COVID cities",
+  years = 2017:2020,
+  spec = "full",
+  drop_city_names = covid_gdp_cities,
+  seed = 42,
+  include_did_event = FALSE
+)
+quiet_cat(sprintf("\nCOVID/GDP combined-exclusion cities: %d\n", length(covid_gdp_cities)))
+print_bundle_results(covid_gdp_bundle)
+
+regional_exclusion_city_lookup <- base_eci %>%
+  filter(city_name %in% regional_exclusion_city_names) %>%
+  distinct(city_name, city_cluster) %>%
+  arrange(city_name, city_cluster)
+regional_exclusion_city_ids <- regional_exclusion_city_lookup$city_name %>% unique()
+regional_exclusion_unmatched <- setdiff(regional_exclusion_city_names, regional_exclusion_city_ids)
+
+regional_exclusion_bundle <- fit_model_bundle(
+  label = "Exclude BTH-YRD-Fenwei cities",
+  years = 2017:2020,
+  spec = "full",
+  drop_city_names = regional_exclusion_city_ids,
+  seed = 42,
+  include_did_event = FALSE
+)
+quiet_cat(sprintf("\nRegional policy-overlap cities excluded: %d\n", length(regional_exclusion_city_ids)))
+print_bundle_results(regional_exclusion_bundle)
+
+additional_robustness_table <- bind_rows(
+  summarise_cf(negative_gdp_bundle) %>% mutate(excluded_cities = length(negative_gdp_cities)),
+  summarise_cf(drop2019_bundle) %>% mutate(excluded_cities = NA_integer_),
+  summarise_cf(covid_bundle) %>% mutate(excluded_cities = length(top_covid_cities)),
+  summarise_cf(covid_gdp_bundle) %>% mutate(excluded_cities = length(covid_gdp_cities)),
+  summarise_cf(regional_exclusion_bundle) %>%
+    mutate(
+      excluded_cities = length(regional_exclusion_city_ids),
+      listed_cities = length(regional_exclusion_city_names),
+      unmatched_listed_cities = length(regional_exclusion_unmatched)
+    )
+)
+print(additional_robustness_table)
+```
+
+# PSM Matched Sample
+
+```{r}
+psm_panel <- make_panel(base_eci, years = 2017:2020, spec = "full")
+psm_covars <- c(
+  "ECI_pre_1519", "ECI_trend_1519", "rainfall",
+  "population_density_pre_1519", "built_share_pre_1519", "cropland_share_pre_1519"
+)
+psm_city <- psm_panel$data %>%
+  filter(Year_calendar < policy_year) %>%
+  group_by(city_name, city_cluster) %>%
+  summarise(
+    yreb = max(yreb, na.rm = TRUE),
+    across(all_of(psm_covars), ~ mean(.x, na.rm = TRUE), .names = "{.col}_psm"),
+    .groups = "drop"
+  ) %>%
+  mutate(across(ends_with("_psm"), ~ ifelse(is.nan(.x), NA_real_, .x))) %>%
+  filter(if_all(ends_with("_psm"), ~ !is.na(.)))
+
+psm_covars_model <- grep("_psm$", names(psm_city), value = TRUE)
+psm_fit <- glm(as.formula(paste0("yreb ~ ", paste(psm_covars_model, collapse = " + "))),
+               data = psm_city, family = binomial())
+psm_city$pscore <- predict(psm_fit, type = "response")
+
+treated_ps <- psm_city$pscore[psm_city$yreb == 1]
+control_ps <- psm_city$pscore[psm_city$yreb == 0]
+ps_lower <- max(min(treated_ps), min(control_ps))
+ps_upper <- min(max(treated_ps), max(control_ps))
+
+treated_df <- psm_city %>%
+  filter(yreb == 1, pscore >= ps_lower, pscore <= ps_upper) %>%
+  arrange(pscore)
+control_df <- psm_city %>%
+  filter(yreb == 0, pscore >= ps_lower, pscore <= ps_upper) %>%
+  arrange(pscore)
+
+available_controls <- seq_len(nrow(control_df))
+matched_pairs_list <- vector("list", nrow(treated_df))
+for (i in seq_len(nrow(treated_df))) {
+  if (length(available_controls) == 0) break
+  diffs <- abs(control_df$pscore[available_controls] - treated_df$pscore[i])
+  nearest_pos <- which.min(diffs)
+  nearest_row <- available_controls[nearest_pos]
+  matched_pairs_list[[i]] <- data.frame(
+    treated_city = treated_df$city_name[i],
+    control_city = control_df$city_name[nearest_row],
+    treated_cluster = treated_df$city_cluster[i],
+    control_cluster = control_df$city_cluster[nearest_row],
+    treated_pscore = treated_df$pscore[i],
+    control_pscore = control_df$pscore[nearest_row],
+    abs_diff = abs(treated_df$pscore[i] - control_df$pscore[nearest_row])
+  )
+  available_controls <- available_controls[-nearest_pos]
+}
+matched_pairs <- bind_rows(matched_pairs_list)
+matched_city_names <- unique(c(matched_pairs$treated_city, matched_pairs$control_city))
+
+psm_bundle <- fit_model_bundle(
+  label = "PSM matched-sample CF",
+  years = 2017:2020,
+  spec = "full",
+  keep_city_names = matched_city_names,
+  seed = 42,
+  include_did_event = FALSE
+)
+quiet_cat(sprintf("\nPSM matched pairs formed: %d\n", nrow(matched_pairs)))
+quiet_cat(sprintf("PSM matched cities used: %d\n", length(matched_city_names)))
+print_bundle_results(psm_bundle)
+
+psm_summary_table <- summarise_cf(psm_bundle) %>%
+  mutate(
+    matched_pairs = nrow(matched_pairs),
+    matched_cities = length(matched_city_names)
+  )
+print(psm_summary_table)
+```
+
+# Placebo, Falsification, And Bootstrap
+
+```{r}
+main_cf <- main_bundle$cf
+data_main <- main_cf$data
+X_main <- main_cf$X
+cf_tuning <- main_cf$cf$tunable.params
+treated_city_names <- data_main %>%
+  filter(yreb == 1) %>%
+  pull(city_name) %>%
+  unique()
+n_treated_cities <- length(treated_city_names)
+all_city_names <- unique(data_main$city_name)
+actual_att <- main_cf$summary$estimate
+
+fit_cf_with_W <- function(W_local, outcome = outcome_var, treatment_name = "W_local",
+                          num_trees = cf_fast_num_trees, seed = 42) {
+  df <- data_main
+  df[[treatment_name]] <- as.numeric(W_local)
+  if (length(unique(W_local)) < 2 || sum(W_local == 1) == 0) {
+    return(data.frame(estimate = NA_real_, std_err = NA_real_, p_value = NA_real_,
+                      n_obs = nrow(df), n_treated = sum(W_local == 1)))
+  }
+  fmlY <- as.formula(paste0(
+    outcome, " ~ ", paste(main_cf$panel$nuisance_vars, collapse = " + "),
+    " | near_ecrl_proxy + ", cluster_var, " + Year_model"
+  ))
+  fmlW <- as.formula(paste0(
+    treatment_name, " ~ ", paste(main_cf$panel$nuisance_vars, collapse = " + "),
+    " | near_ecrl_proxy + ", cluster_var, " + Year_model"
+  ))
+  mY <- feols(fmlY, data = df)
+  mW <- feols(fmlW, data = df)
+  cf_args <- c(
+    list(
+      X = X_main,
+      Y = df[[outcome]],
+      W = as.numeric(W_local),
+      Y.hat = predict(mY),
+      W.hat = pmin(pmax(as.numeric(predict(mW)), 0), 1),
+      clusters = main_cf$clusters,
+      num.trees = num_trees,
+      equalize.cluster.weights = TRUE,
+      honesty = TRUE,
+      tune.parameters = "none",
+      seed = seed
+    ),
+    cf_tuning
+  )
+  cf_local <- do.call(causal_forest, cf_args)
+  ate_local <- average_treatment_effect(cf_local, target.sample = "treated")
+  est <- unname(ate_local[["estimate"]])
+  se <- unname(ate_local[["std.err"]])
+  data.frame(
+    estimate = est,
+    std_err = se,
+    p_value = 2 * pnorm(-abs(est / se)),
+    n_obs = nrow(df),
+    n_treated = sum(W_local == 1)
+  )
+}
+
+quiet_cat(sprintf("\nActual causal-forest ATT estimate: %.4f\n", actual_att))
+
+B <- n_placebo
+set.seed(42)
+random_group_assignments <- lapply(seq_len(B), function(b) {
+  sample(all_city_names, size = n_treated_cities, replace = FALSE)
+})
+
+random_group_results <- bind_rows(
+  parallel_map_with_progress(
+    seq_len(B),
+    function(b) {
+      tryCatch({
+        placebo_treated_cities <- random_group_assignments[[b]]
+        W_p <- as.numeric((data_main$city_name %in% placebo_treated_cities) & data_main$post == 1)
+        fit_cf_with_W(
+          W_local = W_p,
+          treatment_name = "treatment_placebo",
+          num_trees = cf_fast_num_trees,
+          seed = 42
+        ) %>%
+          mutate(iteration = b, placebo_type = "random_group")
+      }, error = function(e) {
+        warning(sprintf("Placebo iteration %d failed: %s", b, e$message))
+        data.frame(iteration = b, estimate = NA_real_, std_err = NA_real_, p_value = NA_real_,
+                   n_obs = NA_integer_, n_treated = NA_integer_, placebo_type = "random_group")
+      })
+    },
+    workers = n_parallel_workers,
+    progress_label = sprintf("Random-assignment placebo progress (%d iterations)", B)
+  )
+)
+random_group_results <- random_group_results %>% filter(!is.na(estimate))
+random_group_percentile <- mean(random_group_results$estimate <= actual_att)
+random_group_p <- mean(abs(random_group_results$estimate) >= abs(actual_att))
+
+B_time_placebo <- n_placebo
+placebo_year_pool <- c(2016L, 2017L, 2018L)
+set.seed(42)
+time_placebo_assignments <- lapply(seq_len(B_time_placebo), function(b) {
+  sample(placebo_year_pool, length(treated_city_names), replace = TRUE)
+})
+
+time_placebo_results <- bind_rows(
+  parallel_map_with_progress(
+    seq_len(B_time_placebo),
+    function(b) {
+      tryCatch({
+        assigned_years <- time_placebo_assignments[[b]]
+        city_timing_map <- data.frame(
+          city_name = treated_city_names,
+          placebo_start_year = assigned_years
+        )
+        placebo_start_vec <- city_timing_map$placebo_start_year[match(data_main$city_name, city_timing_map$city_name)]
+        W_time_perm <- as.numeric(data_main$yreb == 1 & data_main$Year_calendar >= placebo_start_vec)
+        fit_cf_with_W(
+          W_local = W_time_perm,
+          treatment_name = "treatment_time_perm",
+          num_trees = cf_fast_num_trees,
+          seed = 42
+        ) %>%
+          mutate(iteration = b, placebo_type = "randomized_timing")
+      }, error = function(e) {
+        warning(sprintf("Randomized-timing placebo iteration %d failed: %s", b, e$message))
+        data.frame(iteration = b, estimate = NA_real_, std_err = NA_real_, p_value = NA_real_,
+                   n_obs = NA_integer_, n_treated = NA_integer_, placebo_type = "randomized_timing")
+      })
+    },
+    workers = n_parallel_workers,
+    progress_label = sprintf("Randomized-timing placebo progress (%d iterations)", B_time_placebo)
+  )
+) %>%
+  filter(!is.na(estimate))
+time_placebo_percentile <- mean(time_placebo_results$estimate <= actual_att)
+time_placebo_p <- mean(abs(time_placebo_results$estimate) >= abs(actual_att))
+
+outside_yreb_cities <- data_main %>%
+  filter(yreb == 0) %>%
+  pull(city_name) %>%
+  unique()
+outside_yreb_pool_size <- length(outside_yreb_cities)
+spatial_placebo_size <- min(n_treated_cities, outside_yreb_pool_size)
+if (spatial_placebo_size >= outside_yreb_pool_size) {
+  # The ECI sample has fewer non-YREB cities than treated YREB cities. Sampling all
+  # non-YREB cities every time makes the placebo assignment deterministic, so use
+  # random non-YREB subsets instead and report the reduced pseudo-treated size.
+  spatial_placebo_size <- max(1L, floor(outside_yreb_pool_size / 2))
+  warning(sprintf(
+    "Spatial placebo candidate pool has only %d non-YREB cities vs %d treated cities; using random subsets of %d cities.",
+    outside_yreb_pool_size, n_treated_cities, spatial_placebo_size
+  ))
+}
+
+B_spatial_placebo <- n_placebo
+set.seed(42)
+spatial_placebo_assignments <- lapply(seq_len(B_spatial_placebo), function(b) {
+  sample(outside_yreb_cities, size = spatial_placebo_size, replace = FALSE)
+})
+spatial_placebo_results <- bind_rows(
+  parallel_map_with_progress(
+    seq_len(B_spatial_placebo),
+    function(b) {
+      tryCatch({
+        pseudo_treated_cities <- spatial_placebo_assignments[[b]]
+        W_spatial_placebo <- as.numeric((data_main$city_name %in% pseudo_treated_cities) & data_main$post == 1)
+        fit_cf_with_W(
+          W_local = W_spatial_placebo,
+          treatment_name = "treatment_spatial_placebo",
+          num_trees = cf_fast_num_trees,
+          seed = 42
+        ) %>%
+          mutate(iteration = b, placebo_type = "spatial_placebo")
+      }, error = function(e) {
+        warning(sprintf("Spatial placebo iteration %d failed: %s", b, e$message))
+        data.frame(iteration = b, estimate = NA_real_, std_err = NA_real_, p_value = NA_real_,
+                   n_obs = NA_integer_, n_treated = NA_integer_, placebo_type = "spatial_placebo")
+      })
+    },
+    workers = n_parallel_workers,
+    progress_label = sprintf("Spatial placebo progress (%d iterations)", B_spatial_placebo)
+  )
+)
+spatial_placebo_results <- spatial_placebo_results %>% filter(!is.na(estimate))
+spatial_placebo_percentile <- mean(spatial_placebo_results$estimate <= actual_att)
+spatial_placebo_p <- mean(abs(spatial_placebo_results$estimate) >= abs(actual_att))
+
+alternative_region_results <- spatial_placebo_results
+
+set.seed(42)
+bootstrap_city_samples <- lapply(seq_len(n_bootstrap), function(i) {
+  sample(all_city_names, length(all_city_names), replace = TRUE)
+})
+bootstrap_results <- bind_rows(
+  parallel_map_with_progress(
+    seq_len(n_bootstrap),
+    function(i) {
+      sampled_cities <- bootstrap_city_samples[[i]]
+      boot_df <- bind_rows(lapply(seq_along(sampled_cities), function(j) {
+        tmp <- data_main %>% filter(city_name == sampled_cities[j])
+        tmp$boot_city_id <- paste0(sampled_cities[j], "_", j)
+        tmp[[cluster_var]] <- tmp$boot_city_id
+        tmp
+      }))
+      panel_boot <- main_cf$panel
+      panel_boot$data <- boot_df
+      res <- tryCatch(
+        fit_cf_model(panel_boot, label = paste0("bootstrap_", i), num_trees = cf_fast_num_trees,
+                     seed = 42, tune = FALSE),
+        error = function(e) NULL
+      )
+      if (is.null(res)) {
+        data.frame(iteration = i, estimate = NA_real_, std_err = NA_real_, p_value = NA_real_)
+      } else {
+        res$summary %>%
+          transmute(iteration = i, estimate = estimate, std_err = std_err, p_value = p_value)
+      }
+    },
+    workers = n_parallel_workers,
+    progress_label = sprintf("Bootstrap progress (%d iterations)", n_bootstrap)
+  )
+)
+bootstrap_summary <- bootstrap_results %>%
+  filter(!is.na(estimate)) %>%
+  summarise(
+    n = n(),
+    mean_estimate = mean(estimate),
+    sd_estimate = sd(estimate),
+    ci95_lo = quantile(estimate, 0.025),
+    ci95_hi = quantile(estimate, 0.975),
+    p_bootstrap = 2 * min(mean(estimate >= 0), mean(estimate <= 0))
+  )
+
+placebo_bootstrap_table <- bind_rows(
+  data.frame(
+    check = "random_group_placebo",
+    n = nrow(random_group_results),
+    estimate = mean(random_group_results$estimate, na.rm = TRUE),
+    std = sd(random_group_results$estimate, na.rm = TRUE),
+    p_value = random_group_p,
+    note = sprintf("actual percentile = %.3f", random_group_percentile)
+  ),
+  data.frame(
+    check = "randomized_timing_placebo",
+    n = nrow(time_placebo_results),
+    estimate = mean(time_placebo_results$estimate, na.rm = TRUE),
+    std = sd(time_placebo_results$estimate, na.rm = TRUE),
+    p_value = time_placebo_p,
+    note = sprintf("actual percentile = %.3f", time_placebo_percentile)
+  ),
+  data.frame(
+    check = "spatial_placebo",
+    n = nrow(spatial_placebo_results),
+    estimate = mean(spatial_placebo_results$estimate, na.rm = TRUE),
+    std = sd(spatial_placebo_results$estimate, na.rm = TRUE),
+    p_value = spatial_placebo_p,
+    note = sprintf(
+      "actual percentile = %.3f; pseudo-treated cities = %d; non-YREB candidate pool = %d",
+      spatial_placebo_percentile, spatial_placebo_size, outside_yreb_pool_size
+    )
+  ),
+  data.frame(
+    check = "bootstrap",
+    n = bootstrap_summary$n,
+    estimate = bootstrap_summary$mean_estimate,
+    std = bootstrap_summary$sd_estimate,
+    p_value = bootstrap_summary$p_bootstrap,
+    note = sprintf("95%% CI [%.3f, %.3f]", bootstrap_summary$ci95_lo, bootstrap_summary$ci95_hi)
+  )
+)
+print(placebo_bootstrap_table)
+```
+
+# Heterogeneity
+
+```{r}
+label_map <- c(
+  rainfall = "Rainfall",
+  population_density_km2 = "Population density",
+  built_share = "Built-up share",
+  cropland_share = "Cropland share",
+  ECI_pre_1519 = "Pre-policy ECI",
+  ECI_trend_1519 = "Pre-policy ECI trend",
+  population_density_pre_1519 = "Pre-policy population density",
+  built_share_pre_1519 = "Pre-policy built-up share",
+  cropland_share_pre_1519 = "Pre-policy cropland share"
+)
+
+std_with <- function(df_mat_like, cf_res = main_cf) {
+  as.matrix(sweep(sweep(df_mat_like, 2, cf_res$x_center, "-"), 2, cf_res$x_scale, "/"))
+}
+
+pdp_cf <- function(cf_res, var, ci_boot = pdp_ci_boot, seed = 42) {
+  set.seed(seed)
+  Xdf <- cf_res$X_df
+  grid <- unique(sort(as.numeric(quantile(Xdf[[var]], seq(0.05, 0.95, length.out = 21), na.rm = TRUE))))
+  all_pred <- lapply(seq_along(grid), function(k) {
+    Xk <- Xdf
+    Xk[[var]] <- grid[k]
+    tau_hat <- predict(cf_res$cf, newdata = std_with(Xk, cf_res))$predictions
+    data.frame(grid = grid[k], id = seq_along(tau_hat), tau = as.numeric(tau_hat))
+  }) %>% bind_rows()
+  pdp <- all_pred %>%
+    group_by(grid) %>%
+    summarise(tau_mean = mean(tau, na.rm = TRUE), .groups = "drop")
+  ids <- unique(all_pred$id)
+  boots <- replicate(ci_boot, {
+    boot_ids <- tibble::tibble(id = sample(ids, length(ids), replace = TRUE), boot_row = seq_along(ids))
+    all_pred %>%
+      inner_join(boot_ids, by = "id", relationship = "many-to-many") %>%
+      group_by(grid) %>%
+      summarise(tau_mean = mean(tau), .groups = "drop") %>%
+      pull(tau_mean)
+  })
+  pdp$ci_lo <- apply(boots, 1, quantile, 0.025, na.rm = TRUE)
+  pdp$ci_hi <- apply(boots, 1, quantile, 0.975, na.rm = TRUE)
+  pdp %>% mutate(Variable = var, Label = unname(label_map[[var]]))
+}
+
+pdp_all <- bind_rows(lapply(main_cf$vi$Variable, function(v) pdp_cf(main_cf, v)))
+
+city_ite <- main_cf$data %>%
+  filter(treatment == 1) %>%
+  group_by(city_name, city_cluster, PROV) %>%
+  summarise(ATT = mean(ITE, na.rm = TRUE), .groups = "drop")
+
+province_att <- city_ite %>%
+  group_by(PROV) %>%
+  summarise(ATT = mean(ATT, na.rm = TRUE), n_cities = n(), .groups = "drop") %>%
+  mutate(
+    PROV_plot = dplyr::recode(
+      PROV,
+      "上海市" = "Shanghai",
+      "江苏省" = "Jiangsu",
+      "浙江省" = "Zhejiang",
+      "安徽省" = "Anhui",
+      "江西省" = "Jiangxi",
+      "湖北省" = "Hubei",
+      "湖南省" = "Hunan",
+      "重庆市" = "Chongqing",
+      "四川省" = "Sichuan",
+      "贵州省" = "Guizhou",
+      "云南省" = "Yunnan",
+      .default = PROV
+    ),
+    region = case_when(
+      PROV %in% c("上海市", "江苏省", "浙江省", "安徽省") ~ "YRD",
+      PROV %in% c("江西省", "湖北省", "湖南省") ~ "Midstream",
+      PROV %in% c("重庆市", "四川省", "贵州省", "云南省") ~ "Upstream",
+      TRUE ~ "Other"
+    )
+  )
+
+region_att <- province_att %>%
+  filter(region != "Other") %>%
+  group_by(region) %>%
+  summarise(ATT = mean(ATT, na.rm = TRUE), n_provinces = n(), .groups = "drop")
+
+heterogeneity_table <- bind_rows(
+  main_cf$vi %>%
+    transmute(section = "variable_importance", item = Variable, value = Importance, n = NA_integer_),
+  province_att %>%
+    transmute(section = "province_ATT", item = PROV, value = ATT, n = n_cities),
+  region_att %>%
+    transmute(section = "region_ATT", item = region, value = ATT, n = n_provinces)
+)
+print(heterogeneity_table)
+```
+
+# Export
+
+```{r}
+all_cf_summaries <- bind_rows(
+  main_bundle$cf$summary,
+  reduced_bundle$cf$summary,
+  full_year_bundle$cf$summary,
+  drop2019_bundle$cf$summary,
+  negative_gdp_bundle$cf$summary,
+  covid_bundle$cf$summary,
+  covid_gdp_bundle$cf$summary,
+  regional_exclusion_bundle$cf$summary,
+  psm_bundle$cf$summary
+)
+
+all_did <- bind_rows(
+  main_bundle$did,
+  reduced_bundle$did,
+  full_year_bundle$did
+)
+
+all_event <- bind_rows(
+  main_bundle$event$coefficients,
+  reduced_bundle$event$coefficients,
+  full_year_bundle$event$coefficients
+)
+
+all_event_wald <- bind_rows(
+  main_bundle$event$wald,
+  reduced_bundle$event$wald,
+  full_year_bundle$event$wald
+)
+
+placebo_summary <- bind_rows(random_group_results, time_placebo_results, alternative_region_results) %>%
+  group_by(placebo_type) %>%
+  summarise(
+    n = sum(!is.na(estimate)),
+    mean_estimate = mean(estimate, na.rm = TRUE),
+    sd_estimate = sd(estimate, na.rm = TRUE),
+    p_randomization = mean(abs(estimate) >= abs(actual_att), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bootstrap_summary <- bootstrap_results %>%
+  filter(!is.na(estimate)) %>%
+  summarise(
+    n = n(),
+    mean_estimate = mean(estimate),
+    sd_estimate = sd(estimate),
+    ci95_lo = quantile(estimate, 0.025),
+    ci95_hi = quantile(estimate, 0.975),
+    p_bootstrap = 2 * min(mean(estimate >= 0), mean(estimate <= 0))
+  )
+
+wb <- createWorkbook()
+addWorksheet(wb, "Sample_summary")
+writeData(wb, "Sample_summary", sample_summary)
+addWorksheet(wb, "City_match_diagnostics")
+writeData(wb, "City_match_diagnostics", city_match_diagnostics)
+addWorksheet(wb, "CF_summary")
+writeData(wb, "CF_summary", all_cf_summaries)
+addWorksheet(wb, "DID_summary")
+writeData(wb, "DID_summary", all_did)
+addWorksheet(wb, "Event_study")
+writeData(wb, "Event_study", all_event)
+addWorksheet(wb, "Event_wald")
+writeData(wb, "Event_wald", all_event_wald)
+addWorksheet(wb, "Main_variable_importance")
+writeData(wb, "Main_variable_importance", main_bundle$cf$vi)
+addWorksheet(wb, "Reduced_var_importance")
+writeData(wb, "Reduced_var_importance", reduced_bundle$cf$vi)
+addWorksheet(wb, "Extended_var_importance")
+writeData(wb, "Extended_var_importance", full_year_bundle$cf$vi)
+addWorksheet(wb, "Main_data_with_ITE")
+writeData(wb, "Main_data_with_ITE", main_bundle$cf$data %>%
+            select(city_name, city_cluster, PROV, HJYSGKFQBM, Year_calendar, Year_model,
+                   ECI_model, treatment, all_of(main_bundle$cf$panel$x_vars), ITE))
+addWorksheet(wb, "PDP_all_variables")
+writeData(wb, "PDP_all_variables", pdp_all)
+addWorksheet(wb, "Province_ATT")
+writeData(wb, "Province_ATT", province_att)
+addWorksheet(wb, "Region_ATT")
+writeData(wb, "Region_ATT", region_att)
+addWorksheet(wb, "COVID_GDP_checks")
+writeData(
+  wb,
+  "COVID_GDP_checks",
+  bind_rows(
+    gdp_change %>% filter(city_name %in% negative_gdp_cities) %>% mutate(check = "negative_gdp_growth_2020"),
+    covid_2020 %>% filter(city_name %in% top_covid_cities) %>% mutate(check = "top_decile_covid_2020")
+  )
+)
+addWorksheet(wb, "Regional_exclusion")
+regional_exclusion_unmatched_df <- if (length(regional_exclusion_unmatched) == 0L) {
+  data.frame(city_name = character(0), city_cluster = character(0), match_status = character(0))
+} else {
+  data.frame(city_name = regional_exclusion_unmatched, city_cluster = NA_character_, match_status = "unmatched")
+}
+writeData(
+  wb,
+  "Regional_exclusion",
+  bind_rows(
+    regional_exclusion_city_lookup %>% mutate(match_status = "matched"),
+    regional_exclusion_unmatched_df
+  )
+)
+addWorksheet(wb, "PSM_pairs")
+writeData(wb, "PSM_pairs", matched_pairs)
+addWorksheet(wb, "Placebo_iterations")
+writeData(wb, "Placebo_iterations", bind_rows(random_group_results, time_placebo_results, alternative_region_results))
+addWorksheet(wb, "Placebo_summary")
+writeData(wb, "Placebo_summary", placebo_summary)
+addWorksheet(wb, "Bootstrap_iterations")
+writeData(wb, "Bootstrap_iterations", bootstrap_results)
+addWorksheet(wb, "Bootstrap_summary")
+writeData(wb, "Bootstrap_summary", bootstrap_summary)
+addWorksheet(wb, "Excluded_cities")
+excluded_cities_df <- bind_rows(
+  data.frame(check = "negative_gdp_growth_2020", city_name = negative_gdp_cities),
+  data.frame(check = "top_decile_covid_2020", city_name = top_covid_cities),
+  data.frame(check = "negative_gdp_or_top_covid_2020", city_name = covid_gdp_cities),
+  data.frame(check = "BTH_YRD_Fenwei_exclusion", city_name = regional_exclusion_city_ids),
+  data.frame(check = "psm_matched_sample", city_name = matched_city_names)
+)
+writeData(wb, "Excluded_cities", excluded_cities_df)
+saveWorkbook(wb, "ECI_calendar_year_main_robustness_results.xlsx", overwrite = TRUE)
+
+export_summary_table <- all_cf_summaries %>%
+  transmute(
+    model,
+    cf_att = estimate,
+    cf_se = std_err,
+    cf_p = p_value,
+    n_obs,
+    n_units,
+    n_cities
+  )
+print(export_summary_table)
+```
+
+# Figures
+
+```{r}
+main_bundle$event$plot
+reduced_bundle$event$plot
+full_year_bundle$event$plot
+
+ggsave("event_study_ECI_calendar_main.png", main_bundle$event$plot, width = 6, height = 4, dpi = 300, bg = "white")
+ggsave("event_study_ECI_calendar_reducedX.png", reduced_bundle$event$plot, width = 6, height = 4, dpi = 300, bg = "white")
+ggsave("event_study_ECI_calendar_2015_2020.png", full_year_bundle$event$plot, width = 6, height = 4, dpi = 300, bg = "white")
+
+p_placebo <- ggplot(random_group_results, aes(x = estimate)) +
+  geom_histogram(bins = 25, fill = "lightblue", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = actual_att, linetype = "dashed", linewidth = 1, color = "red") +
+  labs(
+    title = sprintf("Distribution of placebo ATT (%d random assignments)", nrow(random_group_results)),
+    subtitle = sprintf("Actual ATT = %.4f; percentile = %.3f", actual_att, random_group_percentile),
+    x = "Placebo ATT estimates",
+    y = "Frequency"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank(), panel.border = element_rect(linewidth = 1))
+p_placebo
+ggsave("placebo_ATT_distribution_ECI.png", p_placebo, width = 6, height = 4, dpi = 300)
+
+p_time_placebo <- ggplot(time_placebo_results, aes(x = estimate)) +
+  geom_histogram(bins = 30, fill = "grey75", color = "black") +
+  geom_vline(xintercept = actual_att, color = "red", linewidth = 1) +
+  labs(
+    title = "Randomized Treatment-Timing Placebo Distribution (Causal Forest)",
+    subtitle = sprintf("Actual ATT = %.4f; percentile = %.3f", actual_att, time_placebo_percentile),
+    x = "Placebo ATT estimates",
+    y = "Frequency"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank(), panel.border = element_rect(linewidth = 1))
+p_time_placebo
+ggsave("time_placebo_randomized_timing_ECI.png", p_time_placebo, width = 6, height = 4, dpi = 300)
+
+p_spatial_placebo <- ggplot(spatial_placebo_results, aes(x = estimate)) +
+  geom_histogram(bins = 30, fill = "lightgreen", color = "black") +
+  geom_vline(xintercept = actual_att, color = "red", linewidth = 1) +
+  labs(
+    title = "Spatial Placebo Distribution (Pseudo-Treated Non-YREB Cities)",
+    subtitle = sprintf("Actual ATT = %.4f; percentile = %.3f", actual_att, spatial_placebo_percentile),
+    x = "Placebo ATT estimates",
+    y = "Frequency"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank(), panel.border = element_rect(linewidth = 1))
+p_spatial_placebo
+ggsave("spatial_placebo_randomized_experimental_group_ECI.png", p_spatial_placebo, width = 6, height = 4, dpi = 300)
+
+pdp_plots <- lapply(main_cf$vi$Variable, function(v) {
+  tmp <- pdp_all %>% filter(Variable == v)
+  ggplot(tmp, aes(x = grid, y = tau_mean)) +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = "#506E91", alpha = 0.18, colour = NA) +
+    geom_line(color = "#506E91", linewidth = 0.9) +
+    labs(x = unname(label_map[[v]]), y = "Average policy effect")
+})
+p_pdp_all <- wrap_plots(pdp_plots, ncol = 3, byrow = TRUE) +
+  plot_annotation(tag_levels = list(letters[3:(length(pdp_plots) + 2)]))
+p_pdp_all
+ggsave("Fig4_ECI_calendar_main_PDP_all_variables.png", p_pdp_all, width = 13, height = 10, dpi = 600, bg = "white")
+
+p_spatial <- ggplot(province_att, aes(x = reorder(PROV_plot, ATT), y = ATT, fill = region)) +
+  geom_col(width = 0.72) +
+  geom_hline(yintercept = main_cf$summary$estimate, linetype = "dashed", linewidth = 0.5) +
+  coord_flip() +
+  scale_fill_manual(values = c(YRD = "#506E91", Midstream = "#B56576", Upstream = "#57755A", Other = "grey70")) +
+  labs(x = NULL, y = "Province-level ATT", title = "Spatial Heterogeneity of ECI Effects")
+p_spatial
+ggsave("Fig4g_ECI_calendar_main_spatial_ATT.png", p_spatial, width = 6, height = 4.5, dpi = 300, bg = "white")
+
+fig4_results_file <- "ECI_calendar_year_main_robustness_results.xlsx"
+fig4_output_prefix <- "Fig4_ECI"
+
+fig4_base_family <- "Arial"
+fig4_base_font_size <- 10.5
+fig4_panel_linewidth <- 0.28
+fig4_out_width <- 13.5
+fig4_out_height <- 7.38
+
+fig4_label_map <- c(
+  rainfall = "Rainfall",
+  population_density_km2 = "Population density",
+  built_share = "Built-up share",
+  cropland_share = "Cropland share"
+)
+
+fig4_palette_hex <- c("#34A0A4", "#52B69A", "#76C893", "#B5E48C", "#E7F4B9")
+fig4_level_cols <- c("City level" = "#84a354", "Unit level" = "#4895EF")
+
+fig4_arial_pdf <- function(filename, width, height, ...) {
+  grDevices::quartz(
+    file = filename,
+    type = "pdf",
+    width = width,
+    height = height,
+    family = fig4_base_family
+  )
+}
+
+fig4_theme <- theme_bw() +
+  theme(
+    text = element_text(family = fig4_base_family),
+    plot.background = element_blank(),
+    plot.margin = margin(5, 5, 5, 5, "pt"),
+    plot.title = element_text(face = "bold", size = fig4_base_font_size, hjust = 0.5, color = "black"),
+    plot.subtitle = element_text(face = "bold", size = fig4_base_font_size, color = "black"),
+    plot.tag = element_text(size = 14, color = "black", face = "bold"),
+    plot.caption = element_text(size = fig4_base_font_size, color = "grey40"),
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = fig4_panel_linewidth),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    axis.ticks.length = unit(0, "pt"),
+    axis.title = element_text(color = "black", size = fig4_base_font_size),
+    axis.text = element_text(color = "grey20", size = fig4_base_font_size),
+    axis.title.y.left = element_text(margin = margin(0, 8, 0, 0)),
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.key.size = unit(30, "pt"),
+    legend.margin = margin(5, 5, 5, 5, "pt"),
+    legend.title = element_text(face = "bold", size = fig4_base_font_size),
+    legend.text = element_text(size = fig4_base_font_size),
+    legend.position = "none"
+  )
+
+fig4_main_data <- read_xlsx(fig4_results_file, sheet = "Main_data_with_ITE")
+
+fig4_unit_effect <- fig4_main_data %>%
+  filter(Year_calendar == 2020, treatment == 1, !is.na(ITE)) %>%
+  transmute(Level = "Unit level", Level_id = 2, ITE)
+
+fig4_city_effect <- fig4_main_data %>%
+  filter(Year_calendar == 2020, treatment == 1, !is.na(ITE), !is.na(city_name)) %>%
+  group_by(city_name) %>%
+  summarise(ITE = mean(ITE, na.rm = TRUE), n_units = n(), .groups = "drop") %>%
+  transmute(Level = "City level", Level_id = 1, ITE)
+
+fig4_effect_data <- bind_rows(fig4_city_effect, fig4_unit_effect)
+
+set.seed(42)
+fig4_effect_points <- bind_rows(
+  fig4_city_effect,
+  fig4_unit_effect %>% slice_sample(n = min(800, nrow(fig4_unit_effect)))
+)
+
+fig4_effect_lims <- quantile(fig4_unit_effect$ITE, c(0.01, 0.99), na.rm = TRUE)
+fig4_effect_lims <- c(floor(fig4_effect_lims[1]), ceiling(fig4_effect_lims[2]))
+
+fig4_variable_importance <- read_xlsx(fig4_results_file, sheet = "Main_variable_importance") %>%
+  mutate(Label = dplyr::recode(Variable, !!!fig4_label_map, .default = Variable)) %>%
+  arrange(desc(Importance)) %>%
+  mutate(Label = factor(Label, levels = rev(Label)))
+
+fig4_top_response_data <- fig4_main_data %>%
+  filter(Year_calendar == 2020, treatment == 1) %>%
+  mutate(top_response = ITE >= quantile(ITE, 0.75, na.rm = TRUE))
+
+fig4_top_response_table <- lapply(names(fig4_label_map), function(v) {
+  top_vals <- fig4_top_response_data %>% filter(top_response) %>% pull(all_of(v))
+  other_vals <- fig4_top_response_data %>% filter(!top_response) %>% pull(all_of(v))
+
+  data.frame(
+    Variable = unname(fig4_label_map[[v]]),
+    raw_variable = v,
+    TopQ = mean(top_vals, na.rm = TRUE),
+    Other = mean(other_vals, na.rm = TRUE),
+    p = t.test(top_vals, other_vals)$p.value
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    delta_pct = (TopQ - Other) / abs(Other) * 100,
+    abs_lab = case_when(
+      raw_variable == "rainfall" ~ sprintf("%+.1f mm", TopQ - Other),
+      raw_variable == "population_density_km2" ~ sprintf("%+.1f people/km2", TopQ - Other),
+      raw_variable %in% c("built_share", "cropland_share") ~ sprintf("%+.1f pp", (TopQ - Other) * 100),
+      TRUE ~ sprintf("%+.1f", TopQ - Other)
+    ),
+    p_lab = case_when(
+      p < 0.001 ~ "p < 0.001",
+      TRUE ~ paste0("p = ", number(p, accuracy = 0.001))
+    ),
+    delta_lab = sprintf("%+.1f%%", delta_pct),
+    label_x = if_else(raw_variable %in% c("rainfall", "cropland_share"), delta_pct - 5, 14),
+    label_hjust = if_else(raw_variable %in% c("rainfall", "cropland_share"), 1, 0),
+    label_y_shift = case_when(
+      raw_variable == "population_density_km2" ~ 0.10,
+      raw_variable == "built_share" ~ -0.10,
+      TRUE ~ 0
+    ),
+    Variable = factor(Variable, levels = rev(Variable)),
+    y_num = as.numeric(Variable)
+  )
+
+fig4_panel_a <- ggplot(fig4_effect_data, aes(x = Level_id, y = ITE, fill = Level, color = Level)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.5, linetype = "longdash") +
+  geom_half_violin(
+    side = "r",
+    width = 0.9,
+    alpha = 0.5,
+    position = position_nudge(x = 0.16)
+  ) +
+  geom_boxplot(
+    aes(group = Level_id),
+    width = 0.15,
+    outlier.shape = NA,
+    linewidth = 1,
+    position = position_nudge(x = 0.16),
+    fill = "white"
+  ) +
+  geom_point(
+    data = fig4_effect_points,
+    aes(x = Level_id - 0.06),
+    position = position_jitter(width = 0.08, height = 0, seed = 42),
+    shape = 21,
+    size = 1.4,
+    alpha = 0.20,
+    stroke = 0.25
+  ) +
+  coord_flip(ylim = fig4_effect_lims) +
+  scale_fill_manual(values = fig4_level_cols) +
+  scale_color_manual(values = fig4_level_cols) +
+  scale_x_continuous(
+    breaks = c(1.15, 2.15),
+    labels = c(
+      paste0("City level\nn = ", nrow(fig4_city_effect)),
+      paste0("Unit level\nn = ", nrow(fig4_unit_effect))
+    )
+  ) +
+  scale_y_continuous(labels = number_format(accuracy = 1)) +
+  labs(x = "", y = "Estimated policy effect on ECI") +
+  fig4_theme +
+  theme(plot.margin = margin(5, 23, 5, 5, "pt"))
+
+fig4_panel_b <- ggplot(fig4_top_response_table, aes(x = delta_pct, y = y_num, fill = delta_pct)) +
+  geom_vline(xintercept = 0, color = "grey70", linewidth = 0.5, linetype = "longdash") +
+  geom_rect(
+    aes(
+      xmin = pmin(delta_pct, 0),
+      xmax = pmax(delta_pct, 0),
+      ymin = y_num - 0.4,
+      ymax = y_num + 0.4
+    ),
+    color = NA,
+    alpha = 0.7
+  ) +
+  geom_text(
+    aes(x = label_x, y = y_num + label_y_shift + 0.34, label = delta_lab, hjust = label_hjust),
+    size = fig4_base_font_size / .pt,
+    color = "black",
+    fontface = "bold",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    aes(x = label_x, y = y_num + label_y_shift, label = abs_lab, hjust = label_hjust),
+    size = fig4_base_font_size / .pt,
+    color = "black",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    aes(x = label_x, y = y_num + label_y_shift - 0.34, label = p_lab, hjust = label_hjust),
+    size = fig4_base_font_size / .pt,
+    color = "black",
+    inherit.aes = FALSE
+  ) +
+  scale_fill_gradientn(
+    colours = rev(fig4_palette_hex),
+    limits = c(
+      -max(abs(fig4_top_response_table$delta_pct), na.rm = TRUE),
+      max(abs(fig4_top_response_table$delta_pct), na.rm = TRUE)
+    ),
+    values = seq(0, 1, length.out = length(fig4_palette_hex)),
+    guide = NULL
+  ) +
+  scale_x_continuous(
+    labels = label_percent(accuracy = 1, scale = 1),
+    limits = c(-110, 75),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  scale_y_continuous(
+    breaks = fig4_top_response_table$y_num,
+    labels = as.character(fig4_top_response_table$Variable),
+    position = "right",
+    expand = expansion(mult = c(0.16, 0.16))
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Percentage", y = NULL) +
+  fig4_theme +
+  theme(
+    axis.title.x = element_text(size = fig4_base_font_size),
+    axis.text.x = element_text(size = fig4_base_font_size),
+    axis.text.y = element_text(size = fig4_base_font_size),
+    plot.margin = margin(5, 12, 5, 18, "pt")
+  )
+
+fig4_panel_c <- ggplot(fig4_variable_importance, aes(x = Label, y = Importance, fill = Importance)) +
+  geom_col(width = 0.75, alpha = 0.8) +
+  coord_flip(clip = "off") +
+  scale_fill_gradientn(colors = rev(fig4_palette_hex), guide = "none") +
+  geom_text(
+    aes(label = number(Importance, accuracy = 0.01)),
+    hjust = -0.2,
+    size = fig4_base_font_size / .pt
+  ) +
+  expand_limits(y = max(fig4_variable_importance$Importance) * 1.10) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(x = NULL, y = "Importance") +
+  fig4_theme +
+  theme(plot.margin = margin(5, 39.3, 5, 5, "pt"))
+
+fig4_eci <- (fig4_panel_a + fig4_panel_b) / (fig4_panel_c + plot_spacer()) +
+  plot_layout(widths = c(1.18, 0.765), heights = c(1.15, 1.32), guides = "collect") +
+  plot_annotation(tag_levels = list(c("a", "b", "c")))
+
+ggsave(
+  paste0(fig4_output_prefix, ".pdf"),
+  fig4_eci,
+  height = fig4_out_height,
+  width = fig4_out_width,
+  device = fig4_arial_pdf
+)
+
+ggsave(
+  paste0(fig4_output_prefix, ".png"),
+  fig4_eci,
+  height = fig4_out_height,
+  width = fig4_out_width,
+  dpi = 900,
+  bg = "white"
+)
+```
